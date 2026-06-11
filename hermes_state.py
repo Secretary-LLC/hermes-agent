@@ -16,6 +16,7 @@ Key design decisions:
 
 import json
 import logging
+import os
 import random
 import re
 import sqlite3
@@ -880,6 +881,20 @@ class SessionDB:
         except Exception:
             pass  # Best effort — never fatal.
 
+    @staticmethod
+    def _postgres_mirror_strict_enabled() -> bool:
+        return os.getenv("HERMES_POSTGRES_STRICT", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
+    def _handle_postgres_mirror_error(self, action: str, exc: Exception) -> None:
+        if self._postgres_mirror_strict_enabled():
+            raise exc
+        logger.warning("Postgres mirror %s failed: %s", action, exc)
+
     def close(self):
         """Close the database connection.
 
@@ -894,6 +909,71 @@ class SessionDB:
                     pass
                 self._conn.close()
                 self._conn = None
+
+    def _mirror_session_after_write(self, session_id: str) -> None:
+        """Best-effort Postgres mirror hook for a committed session row."""
+        if self.read_only or not session_id or self._conn is None:
+            return
+        try:
+            from postgres_mirror import get_postgres_mirror
+
+            mirror = get_postgres_mirror(db_path=self.db_path)
+            if mirror.enabled:
+                mirror.sync_session_by_id(self._conn, session_id)
+        except Exception as exc:
+            self._handle_postgres_mirror_error("session sync", exc)
+
+    def _mirror_message_after_write(self, message_id: int) -> None:
+        """Best-effort Postgres mirror hook for a committed message row."""
+        if self.read_only or not message_id or self._conn is None:
+            return
+        try:
+            from postgres_mirror import get_postgres_mirror
+
+            mirror = get_postgres_mirror(db_path=self.db_path)
+            if mirror.enabled:
+                mirror.sync_message_by_id(self._conn, int(message_id))
+        except Exception as exc:
+            self._handle_postgres_mirror_error("message sync", exc)
+
+    def _mirror_session_with_messages_after_write(self, session_id: str) -> None:
+        """Best-effort Postgres mirror hook for transcript rewrites."""
+        if self.read_only or not session_id or self._conn is None:
+            return
+        try:
+            from postgres_mirror import get_postgres_mirror
+
+            mirror = get_postgres_mirror(db_path=self.db_path)
+            if mirror.enabled:
+                mirror.sync_session_with_messages(self._conn, session_id)
+        except Exception as exc:
+            self._handle_postgres_mirror_error("transcript sync", exc)
+
+    def _mirror_delete_session_after_write(self, session_id: str) -> None:
+        """Best-effort Postgres mirror hook for a committed session delete."""
+        if self.read_only or not session_id:
+            return
+        try:
+            from postgres_mirror import get_postgres_mirror
+
+            mirror = get_postgres_mirror(db_path=self.db_path)
+            if mirror.enabled:
+                mirror.delete_session(session_id)
+        except Exception as exc:
+            self._handle_postgres_mirror_error("session delete", exc)
+
+    def _mirror_delete_sessions_after_write(self, session_ids: List[str]) -> None:
+        """Best-effort Postgres mirror hook for committed bulk session deletes."""
+        if self.read_only or not session_ids:
+            return
+        try:
+            from postgres_mirror import get_postgres_mirror
+
+            mirror = get_postgres_mirror(db_path=self.db_path)
+            if mirror.enabled:
+                mirror.delete_sessions(session_ids)
+        except Exception as exc:
+            self._handle_postgres_mirror_error("session bulk delete", exc)
 
     @staticmethod
     def _parse_schema_columns(schema_sql: str) -> Dict[str, Dict[str, str]]:
@@ -1202,6 +1282,7 @@ class SessionDB:
                 ),
             )
         self._execute_write(_do)
+        self._mirror_session_after_write(session_id)
 
     def create_session(self, session_id: str, source: str, **kwargs) -> str:
         """Create a new session record. Returns the session_id."""
@@ -1224,6 +1305,7 @@ class SessionDB:
                 (time.time(), end_reason, session_id),
             )
         self._execute_write(_do)
+        self._mirror_session_after_write(session_id)
 
     def reopen_session(self, session_id: str) -> None:
         """Clear ended_at/end_reason so a session can be resumed."""
@@ -1233,6 +1315,7 @@ class SessionDB:
                 (session_id,),
             )
         self._execute_write(_do)
+        self._mirror_session_after_write(session_id)
 
     def update_session_cwd(self, session_id: str, cwd: str) -> None:
         """Persist the session working directory when a frontend knows it."""
@@ -1243,6 +1326,7 @@ class SessionDB:
             conn.execute("UPDATE sessions SET cwd = ? WHERE id = ?", (cwd, session_id))
 
         self._execute_write(_do)
+        self._mirror_session_after_write(session_id)
     # ──────────────────────────────────────────────────────────────────────
     # Compression locks
     # ──────────────────────────────────────────────────────────────────────
@@ -1387,6 +1471,7 @@ class SessionDB:
                 (model_config_json, model, session_id),
             )
         self._execute_write(_do)
+        self._mirror_session_after_write(session_id)
 
     def update_system_prompt(self, session_id: str, system_prompt: str) -> None:
         """Store the full assembled system prompt snapshot."""
@@ -1396,6 +1481,7 @@ class SessionDB:
                 (system_prompt, session_id),
             )
         self._execute_write(_do)
+        self._mirror_session_after_write(session_id)
 
     def update_session_model(self, session_id: str, model: str) -> None:
         """Update the model for a session after a mid-session switch.
@@ -1410,6 +1496,7 @@ class SessionDB:
                 (model, session_id),
             )
         self._execute_write(_do)
+        self._mirror_session_after_write(session_id)
 
     def update_token_counts(
         self,
@@ -1509,6 +1596,7 @@ class SessionDB:
         def _do(conn):
             conn.execute(sql, params)
         self._execute_write(_do)
+        self._mirror_session_after_write(session_id)
 
     def ensure_session(
         self,
@@ -1549,6 +1637,7 @@ class SessionDB:
         if sessions_dir and removed_ids:
             for sid in removed_ids:
                 self._remove_session_files(sessions_dir, sid)
+        self._mirror_delete_sessions_after_write(removed_ids)
         return len(removed_ids)
 
     def finalize_orphaned_compression_sessions(self) -> int:
@@ -1563,11 +1652,9 @@ class SessionDB:
 
         def _do(conn):
             now = time.time()
-            result = conn.execute(
+            rows = conn.execute(
                 """
-                UPDATE sessions
-                SET ended_at = ?,
-                    end_reason = 'orphaned_compression'
+                SELECT id FROM sessions
                 WHERE api_call_count = 0
                   AND end_reason IS NULL
                   AND ended_at IS NULL
@@ -1584,11 +1671,24 @@ class SessionDB:
                       WHERE m.session_id = sessions.id
                   )
                 """,
-                (now, cutoff),
+                (cutoff,),
+            ).fetchall()
+            ids = [row["id"] for row in rows]
+            if not ids:
+                return []
+            placeholders = ",".join("?" for _ in ids)
+            conn.execute(
+                "UPDATE sessions "
+                "SET ended_at = ?, end_reason = 'orphaned_compression' "
+                f"WHERE id IN ({placeholders})",
+                (now, *ids),
             )
-            return result.rowcount
+            return ids
 
-        return self._execute_write(_do) or 0
+        updated_ids = self._execute_write(_do) or []
+        for sid in updated_ids:
+            self._mirror_session_after_write(sid)
+        return len(updated_ids)
 
     def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
         """Get a session by ID."""
@@ -1700,6 +1800,8 @@ class SessionDB:
             )
             return cursor.rowcount
         rowcount = self._execute_write(_do)
+        if rowcount > 0:
+            self._mirror_session_after_write(session_id)
         return rowcount > 0
 
     def get_session_title(self, session_id: str) -> Optional[str]:
@@ -1725,6 +1827,8 @@ class SessionDB:
             )
             return cursor.rowcount
         rowcount = self._execute_write(_do)
+        if rowcount > 0:
+            self._mirror_session_after_write(session_id)
         return rowcount > 0
 
     def get_session_by_title(self, title: str) -> Optional[Dict[str, Any]]:
@@ -2322,7 +2426,9 @@ class SessionDB:
                 )
             return msg_id
 
-        return self._execute_write(_do)
+        msg_id = self._execute_write(_do)
+        self._mirror_message_after_write(msg_id)
+        return msg_id
 
     def replace_messages(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
         """Atomically replace every message for a session.
@@ -2409,6 +2515,7 @@ class SessionDB:
             )
 
         self._execute_write(_do)
+        self._mirror_session_with_messages_after_write(session_id)
 
     def get_messages(
         self, session_id: str, include_inactive: bool = False
@@ -2908,6 +3015,7 @@ class SessionDB:
             return ids
 
         rewound = self._execute_write(_do)
+        self._mirror_session_with_messages_after_write(session_id)
 
         # 2) Compute new head id (largest still-active row id in session).
         with self._lock:
@@ -2945,7 +3053,10 @@ class SessionDB:
                 )
             return len(ids)
 
-        return self._execute_write(_do)
+        restored = self._execute_write(_do)
+        if restored:
+            self._mirror_session_with_messages_after_write(session_id)
+        return restored
 
     def list_recent_user_messages(
         self,
@@ -3596,6 +3707,7 @@ class SessionDB:
                 (session_id,),
             )
         self._execute_write(_do)
+        self._mirror_session_with_messages_after_write(session_id)
 
     @staticmethod
     def _remove_session_files(sessions_dir: Optional[Path], session_id: str) -> None:
@@ -3656,6 +3768,7 @@ class SessionDB:
         deleted = self._execute_write(_do)
         if deleted:
             self._remove_session_files(sessions_dir, session_id)
+            self._mirror_delete_session_after_write(session_id)
         return deleted
 
     def delete_sessions(
@@ -3736,6 +3849,7 @@ class SessionDB:
         count = self._execute_write(_do)
         for sid in removed_ids:
             self._remove_session_files(sessions_dir, sid)
+        self._mirror_delete_sessions_after_write(removed_ids)
         return count
 
     def count_empty_sessions(self) -> int:
@@ -3828,6 +3942,7 @@ class SessionDB:
         count = self._execute_write(_do)
         for sid in removed_ids:
             self._remove_session_files(sessions_dir, sid)
+        self._mirror_delete_sessions_after_write(removed_ids)
         return count
 
     def prune_sessions(
@@ -3883,6 +3998,7 @@ class SessionDB:
         # Clean up on-disk files outside the DB transaction
         for sid in removed_ids:
             self._remove_session_files(sessions_dir, sid)
+        self._mirror_delete_sessions_after_write(removed_ids)
         return count
 
     # ── Meta key/value (for scheduler bookkeeping) ──

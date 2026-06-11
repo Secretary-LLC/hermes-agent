@@ -423,6 +423,20 @@ For cloud sandbox backends, persistence is filesystem-oriented. `TERMINAL_LIFETI
 | `GATEWAY_ALLOWED_USERS` | Comma-separated user IDs allowed across all platforms |
 | `GATEWAY_ALLOW_ALL_USERS` | Allow all users without allowlists (`true`/`false`, default: `false`) |
 
+### Secretary Postgres Mirror
+
+Optional local proof-of-concept mirror for Secretary integration work. Hermes still treats SQLite `state.db` as canonical; this mirror is best-effort unless strict mode is explicitly enabled.
+
+| Variable | Description |
+|----------|-------------|
+| `HERMES_POSTGRES_MIRROR_ENABLED` | Enable best-effort mirroring of committed `state.db` session/message writes into Postgres (`true`/`false`, default: `false`). |
+| `HERMES_POSTGRES_DSN` | PostgreSQL connection string for the mirror. For Secretary local development, point this at the existing Secretary Postgres database and isolate Hermes tables with `HERMES_POSTGRES_SCHEMA=hermes`. Defaults to `postgresql://hermes:hermes@127.0.0.1:55432/hermes` for standalone fallback use. Treat this as a secret when it contains credentials. |
+| `HERMES_POSTGRES_SCHEMA` | PostgreSQL schema for mirror tables (default: `hermes`). |
+| `HERMES_POSTGRES_HOME_KEY` | Tenant/home key stored with mirrored rows. Defaults to the active `HERMES_HOME` directory name. |
+| `HERMES_POSTGRES_STRICT` | Fail the SQLite write caller if Postgres mirroring fails (`true`/`false`, default: `false`). Leave disabled for local proof work. |
+| `HERMES_POSTGRES_CONNECT_TIMEOUT` | Postgres connection timeout in seconds (default: `3`). |
+| `HERMES_POSTGRES_STATEMENT_TIMEOUT_MS` | Postgres statement timeout in milliseconds (default: `5000`). |
+
 ### Web Dashboard & Hermes Desktop
 
 Auth for the [web dashboard](/user-guide/features/web-dashboard) and for connecting [Hermes Desktop to a remote backend](/user-guide/features/web-dashboard#connecting-hermes-desktop-to-a-remote-backend). Per the secrets-only convention, credentials belong in `~/.hermes/.env`; the OAuth `client_id` is better set under `dashboard.oauth` in `config.yaml` (env wins when set).
