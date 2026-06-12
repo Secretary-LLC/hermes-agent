@@ -602,6 +602,16 @@ def run_conversation(
                 repaired_seq,
                 agent.session_id or "-",
             )
+            if agent._session_db and agent.session_id:
+                try:
+                    agent._session_db.replace_messages(agent.session_id, messages)
+                    agent._last_flushed_db_idx = len(messages)
+                except Exception:
+                    request_logger.warning(
+                        "Failed to persist repaired message sequence for session=%s",
+                        agent.session_id or "-",
+                        exc_info=True,
+                    )
 
         api_messages = []
         for idx, msg in enumerate(messages):
