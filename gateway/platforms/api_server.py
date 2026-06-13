@@ -1036,6 +1036,10 @@ class APIServerAdapter(BasePlatformAdapter):
 
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
+        effective_ephemeral_system_prompt = self._with_secretary_preloaded_skills(
+            ephemeral_system_prompt,
+            task_id=session_id,
+        )
 
         max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
 
@@ -1049,7 +1053,7 @@ class APIServerAdapter(BasePlatformAdapter):
             max_iterations=max_iterations,
             quiet_mode=True,
             verbose_logging=False,
-            ephemeral_system_prompt=ephemeral_system_prompt or None,
+            ephemeral_system_prompt=effective_ephemeral_system_prompt,
             enabled_toolsets=enabled_toolsets,
             session_id=session_id,
             platform="api_server",
@@ -1063,6 +1067,48 @@ class APIServerAdapter(BasePlatformAdapter):
             gateway_session_key=gateway_session_key,
         )
         return agent
+
+    def _with_secretary_preloaded_skills(
+        self,
+        ephemeral_system_prompt: Optional[str],
+        *,
+        task_id: Optional[str],
+    ) -> Optional[str]:
+        raw_skills = os.getenv("SECRETARY_HERMES_PRELOAD_SKILLS", "").strip()
+        if not raw_skills and os.getenv("SECRETARY_RUNTIME_ID"):
+            raw_skills = "secretary-google-workspace"
+        skill_names = [item.strip() for item in raw_skills.split(",") if item.strip()]
+
+        if not skill_names:
+            return ephemeral_system_prompt or None
+
+        prompt_parts: list[str] = []
+        try:
+            from agent.skill_commands import build_preloaded_skills_prompt
+
+            skill_prompt, loaded, missing = build_preloaded_skills_prompt(
+                skill_names,
+                task_id=task_id,
+            )
+            if skill_prompt:
+                prompt_parts.append(skill_prompt)
+            if missing:
+                logger.warning(
+                    "[api_server] Secretary preloaded skills missing: %s",
+                    ", ".join(missing),
+                )
+            elif loaded:
+                logger.debug(
+                    "[api_server] Secretary preloaded skills: %s",
+                    ", ".join(loaded),
+                )
+        except Exception:
+            logger.exception("[api_server] Failed to preload Secretary skills")
+
+        if ephemeral_system_prompt:
+            prompt_parts.append(ephemeral_system_prompt)
+
+        return "\n\n".join(prompt_parts).strip() or None
 
     # ------------------------------------------------------------------
     # HTTP Handlers
@@ -1641,7 +1687,60 @@ class APIServerAdapter(BasePlatformAdapter):
                 event_name = event_type.replace("tool.", "tool.")
                 _enqueue(event_name, {"message_id": message_id, "tool_name": tool_name, "preview": preview, "args": args})
 
+        approval_session_key = gateway_session_key or session_id
+
+        def _approval_notify(approval_data: Dict[str, Any]) -> None:
+            event = dict(approval_data or {})
+            ui = event.get("ui")
+            if not isinstance(ui, dict):
+                command = str(event.get("command") or "tool")
+                description = str(event.get("description") or "Approval required")
+                approval_id = str(event.get("approval_id") or f"approval_{uuid.uuid4().hex}")
+                ui = {
+                    "version": 1,
+                    "component": "approval_card",
+                    "interactionState": "awaiting_approval",
+                    "title": "Approval required",
+                    "message": description,
+                    "props": {
+                        "command": command,
+                        "description": description,
+                    },
+                    "actions": [
+                        {
+                            "id": "approve",
+                            "label": "Approve",
+                            "kind": "approve",
+                            "variant": "default",
+                            "risk": "write",
+                            "payload": {"approvalId": approval_id},
+                        },
+                        {
+                            "id": "reject",
+                            "label": "Reject",
+                            "kind": "reject",
+                            "variant": "secondary",
+                            "risk": "write",
+                            "payload": {"approvalId": approval_id},
+                        },
+                    ],
+                    "density": "compact",
+                }
+                event["approval_id"] = approval_id
+            _enqueue(
+                "approval.requested",
+                {
+                    "message_id": message_id,
+                    "approval_id": event.get("approval_id"),
+                    "ui": ui,
+                    "preview": event.get("description") or event.get("command") or "",
+                },
+            )
+
         async def _run_and_signal() -> None:
+            from tools.approval import register_gateway_notify, unregister_gateway_notify
+
+            register_gateway_notify(approval_session_key, _approval_notify)
             try:
                 await queue.put(_event_payload("run.started", {"user_message": {"role": "user", "content": user_message}}))
                 await queue.put(_event_payload("message.started", {"message": {"id": message_id, "role": "assistant"}}))
@@ -1677,6 +1776,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 logger.exception("[api_server] session chat stream failed")
                 await queue.put(_event_payload("error", {"message": str(exc)}))
             finally:
+                unregister_gateway_notify(approval_session_key)
                 await queue.put(_event_payload("done", {}))
                 await queue.put(None)
 
@@ -1713,12 +1813,70 @@ class APIServerAdapter(BasePlatformAdapter):
                 data = json.dumps(payload, ensure_ascii=False)
                 await response.write(f"event: {name}\ndata: {data}\n\n".encode("utf-8"))
                 last_write = time.monotonic()
-        except (asyncio.CancelledError, ConnectionResetError):
+        except asyncio.CancelledError:
             task.cancel()
             raise
+        except ConnectionResetError:
+            task.cancel()
+            logger.debug("[api_server] session SSE client disconnected")
         except Exception as exc:
             logger.debug("[api_server] session SSE stream error: %s", exc)
         return response
+
+    async def _handle_session_approval(self, request: "web.Request") -> "web.Response":
+        """POST /api/sessions/{session_id}/approvals/{approval_id}/respond."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        gateway_session_key, key_err = self._parse_session_key_header(request)
+        if key_err is not None:
+            return key_err
+        session_id = request.match_info["session_id"]
+        approval_id = request.match_info["approval_id"]
+        _, err = self._get_existing_session_or_404(session_id)
+        if err:
+            return err
+        body, err = await self._read_json_body(request)
+        if err:
+            return err
+        decision = str(body.get("decision") or "").strip().lower()
+        if decision in {"approve", "approved", "once"}:
+            choice = "once"
+        elif decision in {"reject", "deny", "denied"}:
+            choice = "deny"
+        else:
+            return web.json_response(
+                _openai_error("decision must be approve or reject", code="invalid_decision"),
+                status=400,
+            )
+        try:
+            from tools.approval import resolve_gateway_approval
+
+            resolved = resolve_gateway_approval(
+                gateway_session_key or session_id,
+                choice,
+                approval_id=approval_id,
+            )
+        except Exception as exc:
+            logger.exception("[api_server] session approval resolve failed")
+            return web.json_response(_openai_error(str(exc)), status=500)
+        if resolved <= 0:
+            return web.json_response(
+                _openai_error(
+                    f"Approval not found: {approval_id}",
+                    code="approval_not_found",
+                ),
+                status=404,
+            )
+        return web.json_response(
+            {
+                "object": "hermes.session.approval.response",
+                "session_id": session_id,
+                "approval_id": approval_id,
+                "decision": "approve" if choice == "once" else "reject",
+                "resolved": resolved,
+            }
+        )
 
     async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
         """POST /v1/chat/completions — OpenAI Chat Completions format."""
@@ -4177,6 +4335,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/api/sessions/{session_id}/fork", self._handle_fork_session)
             self._app.router.add_post("/api/sessions/{session_id}/chat", self._handle_session_chat)
             self._app.router.add_post("/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream)
+            self._app.router.add_post("/api/sessions/{session_id}/approvals/{approval_id}/respond", self._handle_session_approval)
             self._app.router.add_post("/v1/chat/completions", self._handle_chat_completions)
             self._app.router.add_post("/v1/responses", self._handle_responses)
             self._app.router.add_get("/v1/responses/{response_id}", self._handle_get_response)

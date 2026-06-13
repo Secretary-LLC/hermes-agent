@@ -333,6 +333,41 @@ def _exc_str(exc: BaseException) -> str:
     return text if text else repr(exc)
 
 
+def _iter_exception_tree(exc: BaseException):
+    yield exc
+    children = getattr(exc, "exceptions", None)
+    if children:
+        for child in children:
+            yield from _iter_exception_tree(child)
+
+
+def _format_mcp_exception_for_user(exc: BaseException) -> str:
+    for child in _iter_exception_tree(exc):
+        response = getattr(child, "response", None)
+        request = getattr(child, "request", None)
+        status_code = getattr(response, "status_code", None)
+        if status_code is None:
+            continue
+        reason = getattr(response, "reason_phrase", "") or ""
+        url = getattr(getattr(response, "request", None), "url", None)
+        if url is None:
+            url = getattr(request, "url", None)
+        detail = f"HTTP {status_code}"
+        if reason:
+            detail = f"{detail} {reason}"
+        if url:
+            detail = f"{detail} for {url}"
+        if status_code == 403:
+            return (
+                f"MCP server rejected the tool call with {detail}. "
+                "Verify the OAuth consent scopes and that the Google Cloud "
+                "project for the OAuth client has the required Google "
+                "Workspace MCP/API services enabled."
+            )
+        return f"MCP server returned {detail}."
+    return f"{type(exc).__name__}: {_exc_str(exc)}"
+
+
 # ---------------------------------------------------------------------------
 # MCP tool description content scanning
 # ---------------------------------------------------------------------------
@@ -1121,6 +1156,7 @@ class MCPServerTask:
     __slots__ = (
         "name", "session", "tool_timeout",
         "_task", "_ready", "_shutdown_event", "_reconnect_event",
+        "_connection_lost_event", "_last_connection_error",
         "_tools", "_error", "_config",
         "_sampling", "_registered_tool_names", "_auth_type", "_refresh_lock",
         "_rpc_lock", "_pending_refresh_tasks",
@@ -1140,6 +1176,8 @@ class MCPServerTask:
         # outer run() loop re-enters the transport so the MCP session is
         # rebuilt with fresh credentials.
         self._reconnect_event = asyncio.Event()
+        self._connection_lost_event = asyncio.Event()
+        self._last_connection_error: Optional[BaseException] = None
         self._tools: list = []
         self._error: Optional[Exception] = None
         self._config: dict = {}
@@ -1430,6 +1468,8 @@ class MCPServerTask:
                     read_stream, write_stream, **sampling_kwargs
                 ) as session:
                     self.initialize_result = await session.initialize()
+                    self._connection_lost_event.clear()
+                    self._last_connection_error = None
                     self.session = session
                     await self._discover_tools()
                     self._ready.set()
@@ -1579,15 +1619,27 @@ class MCPServerTask:
         # If OAuth setup fails (e.g. non-interactive env without cached
         # tokens), re-raise so this server is reported as failed without
         # blocking other MCP servers from connecting.
-        _oauth_auth = None
+        _http_auth = None
         if self._auth_type == "oauth":
             try:
                 from tools.mcp_oauth_manager import get_manager
-                _oauth_auth = get_manager().get_or_build_provider(
+                _http_auth = get_manager().get_or_build_provider(
                     self.name, url, config.get("oauth"),
                 )
             except Exception as exc:
                 logger.warning("MCP OAuth setup failed for '%s': %s", self.name, exc)
+                raise
+        elif self._auth_type == "secretary_google_workspace_postgres":
+            try:
+                from tools.secretary_google_workspace import build_mcp_http_auth
+
+                _http_auth = build_mcp_http_auth(config.get("auth"))
+            except Exception as exc:
+                logger.warning(
+                    "Secretary Google Workspace MCP auth setup failed for '%s': %s",
+                    self.name,
+                    exc,
+                )
                 raise
 
         sampling_kwargs = self._sampling.session_kwargs() if self._sampling else {}
@@ -1618,11 +1670,11 @@ class MCPServerTask:
                 "timeout": float(connect_timeout),
                 "sse_read_timeout": 300.0,
             }
-            if _oauth_auth is not None:
+            if _http_auth is not None:
                 # Pass OAuth auth through to sse_client so SSE MCP servers
                 # behind OAuth 2.1 PKCE work. Previously built but never
                 # forwarded — SSE OAuth would silently fail with 401s.
-                _sse_kwargs["auth"] = _oauth_auth
+                _sse_kwargs["auth"] = _http_auth
             if client_cert is not None or ssl_verify is not True:
                 # SSE transport doesn't expose verify/cert as kwargs, so route
                 # them through an httpx_client_factory that wraps the SDK's
@@ -1659,6 +1711,8 @@ class MCPServerTask:
                     read_stream, write_stream, **sampling_kwargs
                 ) as session:
                     self.initialize_result = await session.initialize()
+                    self._connection_lost_event.clear()
+                    self._last_connection_error = None
                     self.session = session
                     await self._discover_tools()
                     self._ready.set()
@@ -1695,8 +1749,8 @@ class MCPServerTask:
             }
             if headers:
                 client_kwargs["headers"] = headers
-            if _oauth_auth is not None:
-                client_kwargs["auth"] = _oauth_auth
+            if _http_auth is not None:
+                client_kwargs["auth"] = _http_auth
             if client_cert is not None:
                 client_kwargs["cert"] = client_cert
 
@@ -1708,6 +1762,8 @@ class MCPServerTask:
                 ):
                     async with ClientSession(read_stream, write_stream, **sampling_kwargs) as session:
                         self.initialize_result = await session.initialize()
+                        self._connection_lost_event.clear()
+                        self._last_connection_error = None
                         self.session = session
                         await self._discover_tools()
                         self._ready.set()
@@ -1724,13 +1780,15 @@ class MCPServerTask:
                 "timeout": float(connect_timeout),
                 "verify": ssl_verify,
             }
-            if _oauth_auth is not None:
-                _http_kwargs["auth"] = _oauth_auth
+            if _http_auth is not None:
+                _http_kwargs["auth"] = _http_auth
             async with streamablehttp_client(url, **_http_kwargs) as (
                 read_stream, write_stream, _get_session_id,
             ):
                 async with ClientSession(read_stream, write_stream, **sampling_kwargs) as session:
                     self.initialize_result = await session.initialize()
+                    self._connection_lost_event.clear()
+                    self._last_connection_error = None
                     self.session = session
                     await self._discover_tools()
                     self._ready.set()
@@ -1761,7 +1819,14 @@ class MCPServerTask:
         """
         self._config = config
         self.tool_timeout = config.get("timeout", _DEFAULT_TOOL_TIMEOUT)
-        self._auth_type = (config.get("auth") or "").lower().strip()
+        try:
+            from tools.secretary_google_workspace import auth_type_from_config
+
+            self._auth_type = auth_type_from_config(config.get("auth"))
+        except Exception:
+            self._auth_type = (
+                config.get("auth") if isinstance(config.get("auth"), str) else ""
+            ).lower().strip()
 
         # Set up sampling handler if enabled and SDK types are available
         sampling_config = config.get("sampling", {})
@@ -1862,6 +1927,8 @@ class MCPServerTask:
                 self.session = None
                 raise
             except Exception as exc:
+                self._last_connection_error = exc
+                self._connection_lost_event.set()
                 self.session = None
 
                 # If this is the first connection attempt, retry with backoff
@@ -2634,9 +2701,133 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 "error": f"MCP server '{server_name}' is not connected"
             }, ensure_ascii=False)
 
+        try:
+            from tools.secretary_google_workspace import (
+                require_google_mcp_approval,
+                validate_google_mcp_required_scopes,
+            )
+
+            scope_error = validate_google_mcp_required_scopes(
+                getattr(server, "_config", {}).get("auth")
+            )
+            if scope_error:
+                return scope_error
+
+            approval_error = require_google_mcp_approval(
+                server_name=server_name,
+                tool_name=tool_name,
+                args=args if isinstance(args, dict) else {},
+                auth_config=getattr(server, "_config", {}).get("auth"),
+            )
+            if approval_error:
+                return json.dumps({"error": approval_error}, ensure_ascii=False)
+        except ImportError:
+            pass
+        except Exception as approval_exc:
+            logger.warning(
+                "MCP Google Workspace approval gate failed for %s/%s: %s",
+                server_name,
+                tool_name,
+                approval_exc,
+            )
+            return json.dumps(
+                {
+                    "error": (
+                        "BLOCKED: Google Workspace approval gate failed. "
+                        "The mutation was not executed."
+                    )
+                },
+                ensure_ascii=False,
+            )
+
+        def _try_google_workspace_rest_fallback(error_payload: Any) -> str | None:
+            auth_config = getattr(server, "_config", {}).get("auth")
+            try:
+                from tools.secretary_google_workspace_rest import (
+                    execute_google_workspace_rest_fallback,
+                    google_mcp_error_allows_rest_fallback,
+                    google_rest_fallback_supported,
+                )
+            except ImportError:
+                return None
+            if not google_mcp_error_allows_rest_fallback(error_payload):
+                return None
+            if not google_rest_fallback_supported(auth_config, tool_name):
+                return None
+            logger.warning(
+                "Google MCP tool %s/%s permission denied; using REST fallback",
+                server_name,
+                tool_name,
+            )
+            return _run_on_mcp_loop(
+                lambda: execute_google_workspace_rest_fallback(
+                    server_name=server_name,
+                    tool_name=tool_name,
+                    args=args if isinstance(args, dict) else {},
+                    auth_config=auth_config,
+                ),
+                timeout=tool_timeout,
+            )
+
+        def _is_secretary_google_workspace_tool() -> bool:
+            try:
+                from tools.secretary_google_workspace import (
+                    is_secretary_google_workspace_auth,
+                )
+            except ImportError:
+                return False
+            return is_secretary_google_workspace_auth(
+                getattr(server, "_config", {}).get("auth")
+            )
+
+        def _secretary_google_workspace_user_error(error_payload: Any) -> str:
+            text = (
+                json.dumps(error_payload, ensure_ascii=False)
+                if isinstance(error_payload, (dict, list))
+                else str(error_payload or "")
+            )
+            lowered = text.lower()
+            if (
+                "scope" in lowered
+                or "token" in lowered
+                or "not connected" in lowered
+                or "reconnect" in lowered
+                or "revoked" in lowered
+            ):
+                return "Please reconnect Google in Secretary before I try that again."
+            return (
+                "Google did not allow that request. Please reconnect Google in "
+                "Secretary, then try again."
+            )
+
         async def _call():
             async with server._rpc_lock:
-                result = await server.session.call_tool(tool_name, arguments=args)
+                call_task = asyncio.create_task(
+                    server.session.call_tool(tool_name, arguments=args)
+                )
+                connection_lost_task = asyncio.create_task(
+                    server._connection_lost_event.wait()
+                )
+                try:
+                    done, pending = await asyncio.wait(
+                        {call_task, connection_lost_task},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if connection_lost_task in done and not call_task.done():
+                        call_task.cancel()
+                        try:
+                            await call_task
+                        except asyncio.CancelledError:
+                            pass
+                        raise server._last_connection_error or RuntimeError(
+                            f"MCP server '{server_name}' connection lost during "
+                            f"tool call {tool_name}."
+                        )
+                    result = await call_task
+                finally:
+                    for task in (call_task, connection_lost_task):
+                        if not task.done():
+                            task.cancel()
             # MCP CallToolResult has .content (list of content blocks) and .isError
             if result.isError:
                 error_text = ""
@@ -2693,6 +2884,20 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             try:
                 parsed = json.loads(result)
                 if "error" in parsed:
+                    fallback_result = _try_google_workspace_rest_fallback(parsed)
+                    if fallback_result is not None:
+                        _reset_server_error(server_name)
+                        return fallback_result
+                    if _is_secretary_google_workspace_tool():
+                        _bump_server_error(server_name)
+                        return json.dumps(
+                            {
+                                "error": _secretary_google_workspace_user_error(
+                                    parsed.get("error")
+                                )
+                            },
+                            ensure_ascii=False,
+                        )
                     _bump_server_error(server_name)
                 else:
                     _reset_server_error(server_name)  # success — reset
@@ -2722,14 +2927,30 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             if recovered is not None:
                 return recovered
 
+            fallback_result = _try_google_workspace_rest_fallback(
+                {"error": _format_mcp_exception_for_user(exc)}
+            )
+            if fallback_result is not None:
+                _reset_server_error(server_name)
+                return fallback_result
+
             _bump_server_error(server_name)
+            if _is_secretary_google_workspace_tool():
+                return json.dumps(
+                    {
+                        "error": _secretary_google_workspace_user_error(
+                            _format_mcp_exception_for_user(exc)
+                        )
+                    },
+                    ensure_ascii=False,
+                )
             logger.error(
                 "MCP tool %s/%s call failed: %s",
                 server_name, tool_name, exc,
             )
             return json.dumps({
                 "error": _sanitize_error(
-                    f"MCP call failed: {type(exc).__name__}: {_exc_str(exc)}"
+                    f"MCP call failed: {_format_mcp_exception_for_user(exc)}"
                 )
             }, ensure_ascii=False)
 

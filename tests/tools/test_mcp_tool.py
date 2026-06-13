@@ -521,6 +521,112 @@ class TestToolHandler:
         finally:
             _servers.pop("test_srv", None)
 
+    def test_google_workspace_permission_denied_uses_rest_fallback(self):
+        from tools.mcp_tool import _make_tool_handler, _servers
+
+        mock_session = MagicMock()
+        mock_session.call_tool = AsyncMock(
+            return_value=_make_call_result("The caller does not have permission", is_error=True)
+        )
+        server = _make_mock_server("google_calendar", session=mock_session)
+        server._config = {
+            "auth": {
+                "type": "secretary_google_workspace_postgres",
+                "service": "calendar",
+            }
+        }
+        _servers["google_calendar"] = server
+
+        async def fake_rest_fallback(**kwargs):
+            return json.dumps(
+                {
+                    "result": {"items": [{"summary": "Standup"}]},
+                    "source": "google_api",
+                }
+            )
+
+        try:
+            handler = _make_tool_handler("google_calendar", "list_events", 120)
+            with self._patch_mcp_loop(), \
+                 patch(
+                     "tools.secretary_google_workspace.validate_google_mcp_required_scopes",
+                     return_value=None,
+                 ), \
+                 patch(
+                     "tools.secretary_google_workspace.require_google_mcp_approval",
+                     return_value=None,
+                 ), \
+                 patch(
+                     "tools.secretary_google_workspace_rest.execute_google_workspace_rest_fallback",
+                     side_effect=fake_rest_fallback,
+                 ) as fallback:
+                result = json.loads(handler({"calendarId": "primary"}))
+            assert result["source"] == "google_api"
+            assert result["result"]["items"][0]["summary"] == "Standup"
+            fallback.assert_called_once()
+            mock_session.call_tool.assert_called_once_with(
+                "list_events",
+                arguments={"calendarId": "primary"},
+            )
+        finally:
+            _servers.pop("google_calendar", None)
+
+    def test_google_workspace_approved_calendar_update_uses_rest_fallback(self):
+        from tools.mcp_tool import _make_tool_handler, _servers
+
+        mock_session = MagicMock()
+        mock_session.call_tool = AsyncMock(
+            return_value=_make_call_result("The caller does not have permission", is_error=True)
+        )
+        server = _make_mock_server("google_calendar", session=mock_session)
+        server._config = {
+            "auth": {
+                "type": "secretary_google_workspace_postgres",
+                "service": "calendar",
+            }
+        }
+        _servers["google_calendar"] = server
+
+        async def fake_rest_fallback(**kwargs):
+            return json.dumps(
+                {
+                    "result": {"id": "event_123", "summary": "TEST"},
+                    "source": "google_api",
+                }
+            )
+
+        args = {
+            "calendarId": "primary",
+            "eventId": "event_123",
+            "startTime": "2026-06-14T16:30:00",
+            "endTime": "2026-06-14T17:30:00",
+            "timeZone": "Asia/Manila",
+        }
+
+        try:
+            handler = _make_tool_handler("google_calendar", "update_event", 120)
+            with self._patch_mcp_loop(), \
+                 patch(
+                     "tools.secretary_google_workspace.validate_google_mcp_required_scopes",
+                     return_value=None,
+                 ), \
+                 patch(
+                     "tools.secretary_google_workspace.require_google_mcp_approval",
+                     return_value=None,
+                 ) as approval, \
+                 patch(
+                     "tools.secretary_google_workspace_rest.execute_google_workspace_rest_fallback",
+                     side_effect=fake_rest_fallback,
+                 ) as fallback:
+                result = json.loads(handler(args))
+            assert result["source"] == "google_api"
+            assert result["result"]["id"] == "event_123"
+            approval.assert_called_once()
+            fallback.assert_called_once()
+            mock_session.call_tool.assert_called_once_with("update_event", arguments=args)
+        finally:
+            _servers.pop("google_calendar", None)
+
     def test_disconnected_server(self):
         from tools.mcp_tool import _make_tool_handler, _servers
 
